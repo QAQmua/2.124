@@ -1,0 +1,79 @@
+name: Build IPA (Direct Release)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 🌟 修复 1：使用 GitHub 官方目前最新的 macOS 15 (Sequoia) 镜像
+    runs-on: macos-15
+    permissions:
+      contents: write 
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置最新正式版 Xcode 16 环境
+        run: |
+          # 🌟 修复 2：切换到目前最新、最稳定的 Xcode 16.x 正式版
+          XCODE_PATH=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
+          if [ -n "$XCODE_PATH" ]; then
+            sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: 预处理源码包
+        run: |
+          # 解压源码包
+          find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
+
+          # 🌟 修复 3：清理虚构 API，使其兼容真实 Xcode 编译器（否则无法过审和打包）
+          find . -name "*.swift" -exec sed -i '' 's/\.topBarLeading/\.navigationBarLeading/g' {} +
+          find . -name "Assets.xcassets" | tail -n +2 | while read -r dup; do rm -rf "$dup"; done
+
+      - name: 开始云端编译并注入身份证号
+        run: |
+          # 智能定位源码目录（优先使用最新的 .swiftpm）
+          SRC_DIR=$(find . -name "Package.swift" -not -path "*/.*" -exec dirname {} \; | tail -n 1)
+          cd "$SRC_DIR"
+          echo "进入源码目录: $(pwd)"
+          
+          SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+          if [ -z "$SCHEME" ]; then SCHEME="You"; fi
+          echo "编译 Scheme: $SCHEME"
+
+          # 🌟 修复 4：直接编译，并确保报错信息完整打印
+          xcodebuild clean build \
+            -scheme "$SCHEME" \
+            -destination "generic/platform=iOS" \
+            -configuration Release \
+            -derivedDataPath ./build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+          mkdir -p Payload
+          APP_PATH=$(find ./build -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ 未找到编译生成的 .app 文件！"
+            exit 1
+          fi
+          cp -r "$APP_PATH" Payload/
+          
+          # 自动注入 Bundle ID 和 App 名字
+          plutil -replace CFBundleIdentifier -string "com.youdong.app" Payload/*.app/Info.plist
+          plutil -replace CFBundleName -string "幼刀" Payload/*.app/Info.plist || true
+          plutil -replace CFBundleDisplayName -string "幼刀" Payload/*.app/Info.plist || true
+          
+          # 打包成 ipa
+          zip -r output.ipa Payload
+          mv output.ipa $GITHUB_WORKSPACE/You.ipa
+
+      - name: 发布直装版 IPA 到 Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "最新编译直装版 (直接下载 IPA)"
+          files: You.ipa
+          token: ${{ secrets.GITHUB_TOKEN }}
